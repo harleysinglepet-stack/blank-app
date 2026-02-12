@@ -10,6 +10,11 @@
 # - Paginação robusta (limit/offset) para não travar em 1000 linhas
 # - ✅ CONTAGEM REAL DE VOLUME: usa DISTINCT numero_ecommerce (não soma linhas)
 # - ✅ DEDUP no df por numero_ecommerce (garante volume real)
+#
+# ✅ v2.2.1 (ATUALIZAR AGORA = IMPORTA + REFRESH REAL)
+# - Botão "Atualizar agora" chama Edge Function BUSCA-TINY (via x-cron-secret) e depois limpa cache + rerun
+# - Headers anti-cache no REST do Supabase
+# - Troca use_container_width -> width="stretch" (evita warnings)
 
 from __future__ import annotations
 
@@ -70,8 +75,22 @@ def must_get_secret(path: Tuple[str, ...]) -> str:
     return s
 
 
+def get_secret_optional(path: Tuple[str, ...]) -> str:
+    """Busca secrets opcionais (não derruba o app). Retorna '' se não existir."""
+    cur: Any = st.secrets
+    for k in path:
+        cur = cur.get(k, None)
+        if cur is None:
+            return ""
+    return str(cur).strip() if str(cur).strip() else ""
+
+
 SUPABASE_URL = must_get_secret(("supabase", "url"))
 SUPABASE_KEY = must_get_secret(("supabase", "anon_key"))
+
+# ✅ segredo só pra disparar a BUSCA-TINY (não é service_role)
+CRON_SECRET = get_secret_optional(("supabase", "cron_secret"))
+BUSCA_TINY_URL = f"{SUPABASE_URL.rstrip('/')}/functions/v1/BUSCA-TINY"
 
 
 # ========== HELPERS ==========
@@ -93,12 +112,54 @@ def normalize_marketplace(x: Any) -> str:
 
 
 def supabase_headers() -> Dict[str, str]:
-    """Headers para requisições Supabase"""
+    """Headers para requisições Supabase (anti-cache)"""
     return {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Accept": "application/json",
+        # ✅ força não-cache (evita ficar preso em respostas cacheadas)
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
     }
+
+
+def trigger_busca_tiny_import(max_dias: int = 1, incluir_hoje: bool = True) -> Dict[str, Any]:
+    """
+    Dispara a Edge Function BUSCA-TINY para importar dados do Tiny -> Supabase.
+    Requer CRON_SECRET configurado em st.secrets["supabase"]["cron_secret"].
+    """
+    if not CRON_SECRET:
+        return {"ok": False, "erro": "CRON_SECRET não configurado no secrets.toml / Streamlit Secrets."}
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-cron-secret": CRON_SECRET,
+    }
+    payload = {
+        "modo": "resumo_por_dia",
+        "maxDiasPorExec": int(max_dias),
+        "incluirHoje": bool(incluir_hoje),
+    }
+
+    try:
+        r = requests.post(BUSCA_TINY_URL, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text[:800]}
+
+        if r.status_code not in (200, 201):
+            return {
+                "ok": False,
+                "erro": f"BUSCA-TINY HTTP {r.status_code}",
+                "resposta": data,
+            }
+
+        return data if isinstance(data, dict) else {"ok": True, "data": data}
+
+    except Exception as e:
+        return {"ok": False, "erro": str(e)}
 
 
 # ========== CACHE & DATA FETCHING ==========
@@ -115,21 +176,14 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
         * se vier timestamp => aplica UTC -> BR
     - Padroniza df["d"] como datetime64[ns] normalizado (00:00)
     - ✅ Volume real: inclui numero_ecommerce e remove duplicados por ele
-
-    Returns:
-        DataFrame com colunas:
-          - numero_ecommerce
-          - data_pedido
-          - marketplace
-          - d (datetime normalizado)
     """
-    # ✅ Agora traz numero_ecommerce (chave do pedido)
     select_cols = "numero_ecommerce,data_pedido,marketplace"
     base = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{TABLE}"
 
     dt1 = iso(d1)
     dt2_exclusive = iso(d2 + timedelta(days=1))
 
+    # ✅ pega os dois formatos pra garantir compatibilidade
     url_base = (
         f"{base}"
         f"?select={select_cols}"
@@ -145,7 +199,9 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
 
     while True:
         h = supabase_headers()
-        paginated_url = f"{url_base}&offset={offset}"
+
+        # ✅ param extra muda URL e ajuda a evitar cache intermediário
+        paginated_url = f"{url_base}&offset={offset}&_ts={int(time.time())}"
 
         try:
             r = requests.get(paginated_url, headers=h, timeout=HTTP_TIMEOUT)
@@ -209,7 +265,6 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
     df.loc[~df["marketplace"].isin(MPS), "marketplace"] = "Outros"
 
     # ✅ Deduplicação por pedido (volume real)
-    # Mantém o primeiro registro (já ordenado por data_pedido asc)
     df["numero_ecommerce"] = df["numero_ecommerce"].astype(str).str.strip()
     df = df[df["numero_ecommerce"].ne("")].copy()
     df = df.drop_duplicates(subset=["numero_ecommerce"], keep="first").reset_index(drop=True)
@@ -243,7 +298,6 @@ def count_range(df: pd.DataFrame, d1: date, d2: date, mp: Optional[str] = None) 
     d2_ts = pd.Timestamp(d2).normalize()
 
     m = (x["d"] >= d1_ts) & (x["d"] <= d2_ts)
-    # ✅ DISTINCT
     return int(x.loc[m, "numero_ecommerce"].nunique())
 
 
@@ -268,7 +322,6 @@ def daily_pivot(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(index=idx, columns=MPS).fillna(0)
 
-    # ✅ DISTINCT por dia e marketplace
     g = (
         df.groupby(["d", "marketplace"])["numero_ecommerce"]
         .nunique()
@@ -531,7 +584,7 @@ def render_mp_card(col, mp: str, emoji: str, d: Dict[str, Any], class_name: str,
         fig = create_comparison_chart(
             d["hoje"], d["ontem"], d["d7"], d["prev7"], mp, MP_COLORS[mp]["primary"]
         )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -782,7 +835,16 @@ with st.sidebar:
 
     auto = st.toggle("🔄 Auto atualizar (30s)", value=True)
 
-    if st.button("🔄 Atualizar agora", type="primary", use_container_width=True):
+    # ✅ botão agora IMPORTA + REFRESH
+    if st.button("🔄 Atualizar agora", type="primary", width="stretch"):
+        with st.spinner("📦 Importando do Tiny (BUSCA-TINY) e atualizando o painel..."):
+            res = trigger_busca_tiny_import(max_dias=2, incluir_hoje=True)
+
+        if isinstance(res, dict) and res.get("ok") is True:
+            st.success("✅ Import OK! Atualizando painel...")
+        else:
+            st.warning(f"⚠️ Não consegui importar agora. Vou só atualizar o painel.\n\nDetalhe: {res}")
+
         st.cache_data.clear()
         st.rerun()
 
@@ -792,7 +854,7 @@ with st.sidebar:
     base_periodo = st.selectbox(
         "Início da análise:",
         ["01/02/2026", "01/01/2026", "Personalizado"],
-        index=1,  # ✅ por padrão já pega histórico maior
+        index=1,
     )
 
     if base_periodo == "Personalizado":
@@ -822,7 +884,7 @@ with st.sidebar:
     st.caption(
         f"**Dashboard:** Single Pet v2.2 (Volume Real)\n\n"
         f"**Fonte:** Supabase ({TABLE})\n\n"
-        f"**Filtro:** codigo_produto='__PEDIDO__'\n\n"
+        f"**Filtro:** codigo_produto in ('PEDIDO','__PEDIDO__')\n\n"
         f"**Chave de volume:** numero_ecommerce (DISTINCT)\n\n"
         f"**Data Base:** data_pedido (operacional)\n\n"
         f"**Timezone:** {TZ_BR}\n\n"
@@ -834,7 +896,6 @@ agora_br = datetime.now(TZ_BR)
 hoje = agora_br.date()
 hora_atual = agora_br.strftime("%H:%M:%S")
 
-# ✅ IMPORTANTE: para espelhar o banco, buscamos desde o inicio_base (não recorta por tendência)
 inicio_busca = inicio_base
 
 with st.spinner("🔄 Carregando dados do Supabase..."):
@@ -927,14 +988,14 @@ with col_trend:
     tstart = max(inicio_base, hoje - timedelta(days=dias_tendencia - 1))
     pv = daily_pivot(df, tstart, hoje)
     fig_trend = create_trend_chart(pv)
-    st.plotly_chart(fig_trend, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig_trend, width="stretch", config={"displayModeBar": False})
     st.markdown("</div>", unsafe_allow_html=True)
 
 with col_dist:
     st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
     st.markdown("**Distribuição — Últimos 7 dias**", unsafe_allow_html=True)
     fig_donut = create_donut_chart(data_ml["d7"], data_shp["d7"], data_out["d7"])
-    st.plotly_chart(fig_donut, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig_donut, width="stretch", config={"displayModeBar": False})
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ===== INSIGHTS ADICIONAIS =====
@@ -947,7 +1008,6 @@ with col_i1:
     st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
     st.markdown("**📊 Volume Total (período base)**", unsafe_allow_html=True)
 
-    # ✅ total real do período carregado (DISTINCT)
     total_periodo = int(df["numero_ecommerce"].nunique()) if not df.empty else 0
     st.metric(
         "Pedidos (DISTINCT)",
@@ -993,7 +1053,7 @@ with col_i3:
 st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 st.caption(
     f"🔐 **Fonte de Dados:** Supabase ({TABLE}) | "
-    f"**Filtro:** codigo_produto='__PEDIDO__' | "
+    f"**Filtro:** codigo_produto in ('PEDIDO','__PEDIDO__') | "
     f"**Chave do volume:** DISTINCT numero_ecommerce | "
     f"**Data Base:** data_pedido (operacional) | "
     f"**Timezone:** {TZ_BR} | "
