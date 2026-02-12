@@ -1,25 +1,33 @@
-# app.py — DASHBOARD SINGLE PET — TV Vendas (Volume) por Marketplace — SUPABASE
-# Dashboard profissional com cores e visualizações aprimoradas
-# AJUSTE: usa data_importacao (operacional) em vez de data_pedido
-# Vercel URL (produção): https://singlepet-dashboard.vercel.app
+# app.py — DASHBOARD PROFISSIONAL SINGLE PET v2.1 (TIMEZONE FIX)
+# Dashboard de vendas (volume) por marketplace com análise em tempo real
+# Dados operacionais baseados em data_pedido (dia real da venda)
+# Vercel URL: https://singlepet-dashboard.vercel.app
+#
+# 🔧 CORREÇÕES CRÍTICAS v2.1:
+# - Timezone BR explícito (ZoneInfo America/Sao_Paulo)
+# - Filtro REST com range exclusivo (lt amanhã)
+# - Parse robusto DATE vs TIMESTAMP (evita bug de timezone)
+# - Paginação robusta (limit/offset) para não travar em 1000 linhas
+# - Padronização do tipo de df["d"] (datetime64[ns]) para evitar TypeError
 
 from __future__ import annotations
 
 import time
 from datetime import date, timedelta, datetime
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
+# ========== CONFIGURAÇÕES ==========
 HTTP_TIMEOUT = 30
 PAGE_SIZE = 2000
 TABLE = "pedidos_tiny"
-
-# VERCEL (apenas informativo no header/rodapé)
 VERCEL_URL = "https://singlepet-dashboard.vercel.app"
+TZ_BR = ZoneInfo("America/Sao_Paulo")
 
 # Cores profissionais por marketplace
 MP_COLORS = {
@@ -43,17 +51,18 @@ MP_COLORS = {
 MPS = ["Mercado Livre", "Shopee", "Outros"]
 
 
-# ---------- secrets ----------
+# ========== SECRETS & SUPABASE ==========
 def must_get_secret(path: Tuple[str, ...]) -> str:
+    """Busca secrets obrigatórios com validação"""
     cur: Any = st.secrets
     for k in path:
         cur = cur.get(k, None)
         if cur is None:
-            st.error(f"❌ Faltou configurar secrets.toml: {'.'.join(path)}")
+            st.error(f"❌ Configuração ausente: {'.'.join(path)}")
             st.stop()
     s = str(cur).strip()
     if not s:
-        st.error(f"❌ secrets.toml vazio: {'.'.join(path)}")
+        st.error(f"❌ Configuração vazia: {'.'.join(path)}")
         st.stop()
     return s
 
@@ -62,44 +71,26 @@ SUPABASE_URL = must_get_secret(("supabase", "url"))
 SUPABASE_KEY = must_get_secret(("supabase", "anon_key"))
 
 
-# ---------- helpers ----------
+# ========== HELPERS ==========
 def iso(d: date) -> str:
+    """Converte date para string ISO (YYYY-MM-DD)"""
     return d.strftime("%Y-%m-%d")
 
 
-def safe_dt(x: Any) -> Optional[datetime]:
-    """
-    data_importacao é timestamp without time zone.
-    O Supabase REST costuma retornar string ISO.
-    Parse robusto sem dependências externas.
-    """
-    if x is None:
-        return None
-    s = str(x).strip()
-    if not s:
-        return None
-    s2 = s.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(s2.replace("T", " "))
-    except Exception:
-        try:
-            return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return None
-
-
 def normalize_marketplace(x: Any) -> str:
+    """Normaliza nomes de marketplace"""
     s = (str(x) if x is not None else "").strip().lower()
     if not s:
         return "Outros"
     if "shopee" in s:
         return "Shopee"
-    if "mercado" in s or s == "ml" or " ml" in s or "ml " in s or "ml" == s:
+    if "mercado livre" in s or s == "ml":
         return "Mercado Livre"
     return "Outros"
 
 
 def supabase_headers() -> Dict[str, str]:
+    """Headers para requisições Supabase"""
     return {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -107,23 +98,40 @@ def supabase_headers() -> Dict[str, str]:
     }
 
 
+# ========== CACHE & DATA FETCHING ==========
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
     """
-    Filtra por data_importacao (timestamp) e calcula o dia operacional com data_importacao::date.
+    Busca pedidos do Supabase filtrados por data_pedido (data operacional real).
+
+    ✅ Correções finais:
+    - Range exclusivo no fim: [>= d1, < d2+1]
+    - Paginação robusta: limit/offset + order
+    - Parse robusto de data_pedido:
+        * se vier DATE puro (YYYY-MM-DD) => NÃO aplica timezone
+        * se vier timestamp => aplica UTC -> BR
+    - Padroniza df["d"] como datetime64[ns] normalizado (00:00)
+
+    Returns:
+        DataFrame com colunas: data_pedido, marketplace, d (datetime normalizado)
     """
-    select_cols = "data_importacao,marketplace"
+    select_cols = "data_pedido,marketplace"
     base = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{TABLE}"
 
-    dt1 = f"{iso(d1)} 00:00:00"
-    dt2 = f"{iso(d2)} 23:59:59"
+    dt1 = iso(d1)
+    dt2_exclusive = iso(d2 + timedelta(days=1))
 
-    url = (
+    # PostgREST costuma limitar melhor a 1000/req
+    page_size = 1000
+
+    url_base = (
         f"{base}"
         f"?select={select_cols}"
         f"&codigo_produto=eq.__PEDIDO__"
-        f"&data_importacao=gte.{dt1}"
-        f"&data_importacao=lte.{dt2}"
+        f"&data_pedido=gte.{dt1}"
+        f"&data_pedido=lt.{dt2_exclusive}"
+        f"&order=data_pedido.asc"
+        f"&limit={page_size}"
     )
 
     rows: List[Dict[str, Any]] = []
@@ -131,32 +139,65 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
 
     while True:
         h = supabase_headers()
-        h["Range-Unit"] = "items"
-        h["Range"] = f"{offset}-{offset + PAGE_SIZE - 1}"
+        paginated_url = f"{url_base}&offset={offset}"
 
-        r = requests.get(url, headers=h, timeout=HTTP_TIMEOUT)
-        if r.status_code not in (200, 206):
-            raise RuntimeError(f"Supabase HTTP {r.status_code}: {r.text[:500]}")
+        try:
+            r = requests.get(paginated_url, headers=h, timeout=HTTP_TIMEOUT)
+            if r.status_code not in (200, 206):
+                raise RuntimeError(f"Supabase HTTP {r.status_code}: {r.text[:500]}")
 
-        batch = r.json()
-        if not isinstance(batch, list) or not batch:
+            batch = r.json()
+            if not isinstance(batch, list) or not batch:
+                break
+
+            rows.extend(batch)
+
+            if len(batch) < page_size:
+                break
+
+            offset += page_size
+            time.sleep(0.03)
+
+        except Exception as e:
+            st.error(f"❌ Erro ao buscar dados: {str(e)}")
             break
-
-        rows.extend(batch)
-        if len(batch) < PAGE_SIZE:
-            break
-
-        offset += PAGE_SIZE
-        time.sleep(0.03)
 
     df = pd.DataFrame(rows)
     if df.empty:
         return df
 
-    df["dt"] = df["data_importacao"].apply(safe_dt)
-    df = df[df["dt"].notna()].copy()
-    df["d"] = pd.to_datetime(df["dt"]).dt.date
+    # ✅ PARSE DEFINITIVO (DATE vs TIMESTAMP)
+    s = df["data_pedido"].astype(str).str.strip()
+    is_date_only = s.str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)
 
+    # vamos montar uma Series de datetime (naive) normalizada
+    d_series = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+
+    # DATE puro: vira datetime sem timezone
+    if is_date_only.any():
+        d_series.loc[is_date_only] = pd.to_datetime(
+            s[is_date_only],
+            errors="coerce"
+        )
+
+    # Timestamp: parse UTC e converte para BR, depois remove tz (naive)
+    if (~is_date_only).any():
+        dt_utc = pd.to_datetime(
+            s[~is_date_only],
+            utc=True,
+            errors="coerce"
+        )
+        # converte para BR, depois tira timezone (fica naive)
+        dt_br = dt_utc.dt.tz_convert(TZ_BR).dt.tz_localize(None)
+        d_series.loc[~is_date_only] = dt_br
+
+    # normaliza para 00:00 do dia
+    df["d"] = pd.to_datetime(d_series, errors="coerce").dt.normalize()
+
+    # Remove datas inválidas
+    df = df[df["d"].notna()].copy()
+
+    # Normaliza marketplace
     df["marketplace"] = df["marketplace"].apply(normalize_marketplace)
     df.loc[~df["marketplace"].isin(MPS), "marketplace"] = "Outros"
 
@@ -164,41 +205,51 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
 
 
 def last_data_disponivel(df: pd.DataFrame) -> Optional[date]:
+    """Retorna a data do pedido mais recente no dataset (como date)"""
     if df.empty or "d" not in df.columns:
         return None
     s = df["d"].dropna()
-    return None if s.empty else s.max()
-
-
-def last_import_ts(df: pd.DataFrame) -> Optional[datetime]:
-    if df.empty or "dt" not in df.columns:
+    if s.empty:
         return None
-    s = df["dt"].dropna()
-    return None if s.empty else s.max()
+    # df["d"] é datetime normalizado
+    return pd.to_datetime(s.max()).date()
 
 
 def count_range(df: pd.DataFrame, d1: date, d2: date, mp: Optional[str] = None) -> int:
+    """Conta pedidos em um range de datas (inclusive), opcionalmente por marketplace"""
     if df.empty:
         return 0
+
     x = df
     if mp:
         x = x[x["marketplace"] == mp]
-    m = (x["d"] >= d1) & (x["d"] <= d2)
+
+    d1_ts = pd.Timestamp(d1).normalize()
+    d2_ts = pd.Timestamp(d2).normalize()
+
+    # df["d"] é datetime normalizado, então comparação é segura
+    m = (x["d"] >= d1_ts) & (x["d"] <= d2_ts)
     return int(m.sum())
 
 
 def fmt_delta(n: int) -> str:
+    """Formata delta com sinal"""
     return f"+{n}" if n > 0 else str(n)
 
 
 def pct_change(current: int, previous: int) -> float:
+    """Calcula variação percentual"""
     if previous == 0:
         return 0.0 if current == 0 else 100.0
     return ((current - previous) / previous) * 100
 
 
 def daily_pivot(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
-    idx = pd.date_range(start=start, end=end, freq="D")
+    """
+    Cria pivot table com dias nas linhas e marketplaces nas colunas.
+    Preenche dias sem dados com 0.
+    """
+    idx = pd.date_range(start=start, end=end, freq="D").normalize()
 
     if df.empty:
         return pd.DataFrame(index=idx, columns=MPS).fillna(0)
@@ -211,15 +262,16 @@ def daily_pivot(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
             pv[mp] = 0
 
     pv = pv[MPS].sort_index()
-    pv.index = pd.to_datetime(pv.index)
+    pv.index = pd.to_datetime(pv.index).normalize()
     pv = pv.reindex(idx, fill_value=0)
     return pv
 
 
-# ---------- Visualizações Plotly ----------
+# ========== VISUALIZAÇÕES PLOTLY ==========
 def create_comparison_chart(
     hoje_val: int, ontem_val: int, d7_val: int, prev7_val: int, mp: str, color: str
 ) -> go.Figure:
+    """Gráfico de barras comparativo (Hoje vs Ontem | 7D vs 7D Anteriores)"""
     fig = go.Figure()
 
     fig.add_trace(
@@ -230,6 +282,7 @@ def create_comparison_chart(
             text=[hoje_val, ontem_val],
             textposition="outside",
             textfont=dict(size=16, color="white", family="Arial Black"),
+            name="Dia",
         )
     )
 
@@ -241,6 +294,7 @@ def create_comparison_chart(
             text=[d7_val, prev7_val],
             textposition="outside",
             textfont=dict(size=16, color="white", family="Arial Black"),
+            name="Semana",
         )
     )
 
@@ -267,6 +321,7 @@ def create_comparison_chart(
 
 
 def create_trend_chart(pv: pd.DataFrame) -> go.Figure:
+    """Gráfico de área empilhada com evolução diária por marketplace"""
     fig = go.Figure()
 
     for mp in MPS:
@@ -316,6 +371,7 @@ def create_trend_chart(pv: pd.DataFrame) -> go.Figure:
 
 
 def create_donut_chart(ml: int, shp: int, out: int) -> go.Figure:
+    """Gráfico de rosca (donut) com distribuição por marketplace"""
     total = ml + shp + out
     if total == 0:
         return go.Figure()
@@ -355,9 +411,164 @@ def create_donut_chart(ml: int, shp: int, out: int) -> go.Figure:
     return fig
 
 
-# ---------- UI ----------
-st.set_page_config(page_title="Dashboard Single Pet", page_icon="🐾", layout="wide")
+# ========== CÁLCULO DE MÉTRICAS ==========
+def mp_metrics(df: pd.DataFrame, hoje: date, mp: str) -> Dict[str, Any]:
+    """Calcula todas as métricas para um marketplace específico."""
+    ontem = hoje - timedelta(days=1)
+    d7_ini = hoje - timedelta(days=6)
+    prev7_fim = d7_ini - timedelta(days=1)
+    prev7_ini = prev7_fim - timedelta(days=6)
+    mtd_ini = date(hoje.year, hoje.month, 1)
 
+    hoje_mp = count_range(df, hoje, hoje, mp)
+    ontem_mp = count_range(df, ontem, ontem, mp)
+    delta_dia = hoje_mp - ontem_mp
+    pct_dia = pct_change(hoje_mp, ontem_mp)
+
+    d7_mp = count_range(df, d7_ini, hoje, mp)
+    prev7_mp = count_range(df, prev7_ini, prev7_fim, mp)
+    delta_7d = d7_mp - prev7_mp
+    pct_7d = pct_change(d7_mp, prev7_mp)
+
+    mtd_mp = count_range(df, mtd_ini, hoje, mp)
+
+    return {
+        "hoje": hoje_mp,
+        "ontem": ontem_mp,
+        "delta_dia": delta_dia,
+        "pct_dia": pct_dia,
+        "d7": d7_mp,
+        "prev7": prev7_mp,
+        "delta_7d": delta_7d,
+        "pct_7d": pct_7d,
+        "mtd": mtd_mp,
+    }
+
+
+# ========== UI COMPONENTS ==========
+def render_mp_card(col, mp: str, emoji: str, d: Dict[str, Any], class_name: str, hoje: date, ontem: date):
+    """Renderiza card de marketplace com todas as métricas"""
+    with col:
+        st.markdown(f"<div class='mpCard {class_name}'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='mpTitle'>{emoji} {mp}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='mpSub'>"
+            f"Período: Hoje ({hoje.strftime('%d/%m')}) • "
+            f"Ontem ({ontem.strftime('%d/%m')}) • "
+            f"7 Dias • MTD"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        delta_class = (
+            "positive" if d["delta_dia"] > 0 else ("negative" if d["delta_dia"] < 0 else "neutral")
+        )
+
+        st.markdown(
+            f"""
+            <div class='kpi-container'>
+                <div class='kpi-label'>Hoje (até agora)</div>
+                <div class='kpi-value'>{d["hoje"]:,}</div>
+                <span class='kpi-delta {delta_class}'>
+                    {fmt_delta(d["delta_dia"])} ({d["pct_dia"]:+.1f}%)
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            delta_7d_class = (
+                "positive"
+                if d["delta_7d"] > 0
+                else ("negative" if d["delta_7d"] < 0 else "neutral")
+            )
+            st.markdown(
+                f"""
+                <div class='kpi-container'>
+                    <div class='kpi-label'>7 Dias</div>
+                    <div class='kpi-value' style='font-size: 28px;'>{d["d7"]:,}</div>
+                    <span class='kpi-delta {delta_7d_class}' style='font-size: 11px;'>
+                        {fmt_delta(d["delta_7d"])} ({d["pct_7d"]:+.1f}%)
+                    </span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        with col_b:
+            st.markdown(
+                f"""
+                <div class='kpi-container'>
+                    <div class='kpi-label'>MTD</div>
+                    <div class='kpi-value' style='font-size: 28px;'>{d["mtd"]:,}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        fig = create_comparison_chart(
+            d["hoje"], d["ontem"], d["d7"], d["prev7"], mp, MP_COLORS[mp]["primary"]
+        )
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_status_banner(hoje: date, ultima_dia: Optional[date], total_hoje: int, total_ontem: int):
+    """Renderiza banner de status com informações sobre a atualização dos dados"""
+    if ultima_dia is None:
+        st.error("❌ Nenhum dado encontrado no período selecionado")
+        return
+
+    dias_diferenca = (hoje - ultima_dia).days
+
+    if dias_diferenca == 0:
+        if total_hoje > 0:
+            hora_atual = datetime.now(TZ_BR).strftime("%H:%M")
+            variacao = total_hoje - total_ontem
+            pct = pct_change(total_hoje, total_ontem)
+
+            delta_emoji = "📈" if variacao > 0 else ("📉" if variacao < 0 else "➡️")
+            delta_text = f"{fmt_delta(variacao)} ({pct:+.1f}%)"
+
+            st.success(
+                f"✅ **Dados atualizados até agora ({hora_atual})** | "
+                f"Hoje: **{total_hoje}** pedidos | "
+                f"Ontem: **{total_ontem}** | "
+                f"Variação: {delta_emoji} **{delta_text}**"
+            )
+        else:
+            st.info(
+                f"ℹ️ **Aguardando primeiros pedidos de hoje** ({hoje.strftime('%d/%m/%Y')}). "
+                f"Ontem foram **{total_ontem}** pedidos."
+            )
+    elif dias_diferenca == 1:
+        st.warning(
+            f"⚠️ **Dados de hoje ainda não foram importados**. "
+            f"Último dia com dados: **{ultima_dia.strftime('%d/%m/%Y')}** (ontem). "
+            f"Total ontem: **{total_ontem}** pedidos."
+        )
+    else:
+        st.error(
+            f"❌ **Dados desatualizados!** "
+            f"Último dia com dados: **{ultima_dia.strftime('%d/%m/%Y')}** "
+            f"(**{dias_diferenca}** dias atrás). "
+            f"Verifique a integração com o Tiny ERP."
+        )
+
+
+# ========== STREAMLIT APP ==========
+st.set_page_config(
+    page_title="Dashboard Single Pet",
+    page_icon="🐾",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# CSS Customizado
 st.markdown(
     """
     <style>
@@ -365,7 +576,7 @@ st.markdown(
       * { font-family: 'Inter', -apple-system, sans-serif; }
 
       .block-container {
-        padding-top: 28px; /* MAIS ESPAÇO PRA NÃO CORTAR A LOGO */
+        padding-top: 28px;
         padding-bottom: 1rem;
         max-width: 100%;
       }
@@ -388,7 +599,6 @@ st.markdown(
         letter-spacing: 0.3px;
       }
 
-      /* ===== BRAND HEADER (SINGLE PET) ===== */
       .brand-wrap{
         margin-top: 8px;
         margin-bottom: 10px;
@@ -532,33 +742,77 @@ st.markdown(
       }
 
       .stPlotlyChart { margin: 0 !important; }
-      .stAlert { background: rgba(251, 191, 36, 0.1); border-left: 4px solid #fbbf24; border-radius: 8px; }
+
+      .debug-box {
+        background: rgba(255,165,0,0.1);
+        border: 1px solid rgba(255,165,0,0.3);
+        border-radius: 8px;
+        padding: 10px;
+        margin: 10px 0;
+        font-size: 12px;
+        font-family: monospace;
+      }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+# ========== SIDEBAR ==========
 with st.sidebar:
     st.header("⚙️ Configurações")
+
     auto = st.toggle("🔄 Auto atualizar (30s)", value=True)
-    if st.button("🔄 Atualizar agora", type="primary"):
+
+    if st.button("🔄 Atualizar agora", type="primary", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
     st.divider()
+
+    st.subheader("📅 Período Base")
     base_periodo = st.selectbox(
-        "📅 Período base:",
-        ["01/02/2026", "01/01/2026"],
+        "Início da análise:",
+        ["01/02/2026", "01/01/2026", "Personalizado"],
         index=0,
     )
-    dias_tendencia = st.slider("📊 Dias da tendência", 7, 30, 14, 1)
 
-hoje = date.today()
+    if base_periodo == "Personalizado":
+        hoje_br = datetime.now(TZ_BR).date()
+        inicio_base = st.date_input(
+            "Data inicial:",
+            value=date(2026, 2, 1),
+            max_value=hoje_br
+        )
+    elif base_periodo == "01/02/2026":
+        inicio_base = date(2026, 2, 1)
+    else:
+        inicio_base = date(2026, 1, 1)
 
-if base_periodo == "01/02/2026":
-    inicio_base = date(2026, 2, 1)
-else:
-    inicio_base = date(2026, 1, 1)
+    st.divider()
+
+    st.subheader("📊 Visualização")
+    dias_tendencia = st.slider("Dias da tendência", 7, 30, 14, 1)
+
+    st.divider()
+
+    debug_mode = st.checkbox("🐛 Modo Debug", value=False)
+
+    st.divider()
+
+    st.subheader("ℹ️ Sobre")
+    st.caption(
+        f"**Dashboard:** Single Pet v2.1\n\n"
+        f"**Fonte:** Supabase ({TABLE})\n\n"
+        f"**Filtro:** codigo_produto='__PEDIDO__'\n\n"
+        f"**Data Base:** data_pedido (operacional)\n\n"
+        f"**Timezone:** {TZ_BR}\n\n"
+        f"**Produção:** {VERCEL_URL}"
+    )
+
+# ========== MAIN APP ==========
+agora_br = datetime.now(TZ_BR)
+hoje = agora_br.date()
+hora_atual = agora_br.strftime("%H:%M:%S")
 
 inicio_mes = date(hoje.year, hoje.month, 1)
 inicio_busca = min(inicio_base, inicio_mes, hoje - timedelta(days=dias_tendencia + 14))
@@ -567,9 +821,8 @@ with st.spinner("🔄 Carregando dados do Supabase..."):
     df = fetch_resumo(inicio_busca, hoje)
 
 ultima_dia = last_data_disponivel(df)
-ultima_ts = last_import_ts(df)
 
-# ===== HEADER (SINGLE PET) =====
+# ===== HEADER =====
 st.markdown(
     f"""
     <div class="brand-wrap">
@@ -585,143 +838,59 @@ st.markdown(
 )
 
 txt_ultimo_dia = ultima_dia.strftime("%d/%m/%Y") if ultima_dia else "—"
-txt_ultima_ts = ultima_ts.strftime("%d/%m/%Y %H:%M") if ultima_ts else "—"
 
 st.markdown(
     f"<div class='subtitle'>"
-    f"<b>HOJE (operacional)</b>: {hoje.strftime('%d/%m/%Y')} • "
-    f"<b>Último dia (importação)</b>: {txt_ultimo_dia} • "
-    f"<b>Última importação</b>: {txt_ultima_ts} • "
-    f"<b>Fonte</b>: Supabase / {TABLE}"
+    f"<b>HOJE</b>: {hoje.strftime('%d/%m/%Y')} {hora_atual} (BR) • "
+    f"<b>Último dia com dados</b>: {txt_ultimo_dia} • "
+    f"<b>Fonte</b>: Supabase / {TABLE} (data_pedido)"
     f"</div>",
     unsafe_allow_html=True,
 )
 
-if ultima_dia and ultima_dia < hoje:
-    st.warning(
-        f"⚠️ Dados de hoje ({hoje.strftime('%d/%m/%Y')}) ainda não aparecem como importados. "
-        f"Último dia de importação no banco: {ultima_dia.strftime('%d/%m/%Y')}."
-    )
+# ===== DEBUG MODE =====
+if debug_mode:
+    st.markdown("<div class='debug-box'>", unsafe_allow_html=True)
+    st.write("🐛 **DEBUG INFO**")
+    st.write(f"- Hoje (BR): {hoje}")
+    st.write(f"- Hora (BR): {hora_atual}")
+    st.write(f"- Timezone: {TZ_BR}")
+    st.write(f"- Total registros carregados: {len(df)}")
+    if not df.empty:
+        st.write(f"- Min data (d): {df['d'].min().date() if pd.notna(df['d'].min()) else None}")
+        st.write(f"- Max data (d): {df['d'].max().date() if pd.notna(df['d'].max()) else None}")
+        hoje_ts = pd.Timestamp(hoje).normalize()
+        hoje_df = df[df["d"] == hoje_ts]
+        st.write(f"- Registros de hoje: {len(hoje_df)}")
+        if not hoje_df.empty:
+            st.write(f"- Marketplaces hoje: {hoje_df['marketplace'].value_counts().to_dict()}")
+    else:
+        st.write("- DataFrame vazio!")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ===== STATUS BANNER =====
+ontem = hoje - timedelta(days=1)
+total_hoje = count_range(df, hoje, hoje)
+total_ontem = count_range(df, ontem, ontem)
+
+render_status_banner(hoje, ultima_dia, total_hoje, total_ontem)
 
 st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
-# Períodos
-ontem = hoje - timedelta(days=1)
-d7_ini = hoje - timedelta(days=6)
-prev7_fim = d7_ini - timedelta(days=1)
-prev7_ini = prev7_fim - timedelta(days=6)
-mtd_ini = date(hoje.year, hoje.month, 1)
-
-
-def mp_metrics(mp: str) -> Dict[str, Any]:
-    hoje_mp = count_range(df, hoje, hoje, mp)
-    ontem_mp = count_range(df, ontem, ontem, mp)
-    delta_dia = hoje_mp - ontem_mp
-    pct_dia = pct_change(hoje_mp, ontem_mp)
-
-    d7_mp = count_range(df, d7_ini, hoje, mp)
-    prev7_mp = count_range(df, prev7_ini, prev7_fim, mp)
-    delta_7d = d7_mp - prev7_mp
-    pct_7d = pct_change(d7_mp, prev7_mp)
-
-    mtd_mp = count_range(df, mtd_ini, hoje, mp)
-
-    return {
-        "hoje": hoje_mp,
-        "ontem": ontem_mp,
-        "delta_dia": delta_dia,
-        "pct_dia": pct_dia,
-        "d7": d7_mp,
-        "prev7": prev7_mp,
-        "delta_7d": delta_7d,
-        "pct_7d": pct_7d,
-        "mtd": mtd_mp,
-    }
-
-
-data_ml = mp_metrics("Mercado Livre")
-data_shp = mp_metrics("Shopee")
-data_out = mp_metrics("Outros")
+# ===== MÉTRICAS POR MARKETPLACE =====
+data_ml = mp_metrics(df, hoje, "Mercado Livre")
+data_shp = mp_metrics(df, hoje, "Shopee")
+data_out = mp_metrics(df, hoje, "Outros")
 
 c1, c2, c3 = st.columns(3)
 
-
-def render_mp_card(col, mp: str, emoji: str, d: Dict[str, Any], class_name: str):
-    with col:
-        st.markdown(f"<div class='mpCard {class_name}'>", unsafe_allow_html=True)
-        st.markdown(f"<div class='mpTitle'>{emoji} {mp}</div>", unsafe_allow_html=True)
-        st.markdown(
-            f"<div class='mpSub'>"
-            f"Período: Hoje ({hoje.strftime('%d/%m')}) • "
-            f"Ontem ({ontem.strftime('%d/%m')}) • "
-            f"7 Dias • MTD"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-        delta_class = (
-            "positive" if d["delta_dia"] > 0 else ("negative" if d["delta_dia"] < 0 else "neutral")
-        )
-
-        st.markdown(
-            f"""
-            <div class='kpi-container'>
-                <div class='kpi-label'>Hoje (operacional)</div>
-                <div class='kpi-value'>{d["hoje"]:,}</div>
-                <span class='kpi-delta {delta_class}'>
-                    {fmt_delta(d["delta_dia"])} ({d["pct_dia"]:+.1f}%)
-                </span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        col_a, col_b = st.columns(2)
-
-        with col_a:
-            delta_7d_class = (
-                "positive"
-                if d["delta_7d"] > 0
-                else ("negative" if d["delta_7d"] < 0 else "neutral")
-            )
-            st.markdown(
-                f"""
-                <div class='kpi-container'>
-                    <div class='kpi-label'>7 Dias</div>
-                    <div class='kpi-value' style='font-size: 28px;'>{d["d7"]:,}</div>
-                    <span class='kpi-delta {delta_7d_class}' style='font-size: 11px;'>
-                        {fmt_delta(d["delta_7d"])} ({d["pct_7d"]:+.1f}%)
-                    </span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        with col_b:
-            st.markdown(
-                f"""
-                <div class='kpi-container'>
-                    <div class='kpi-label'>MTD</div>
-                    <div class='kpi-value' style='font-size: 28px;'>{d["mtd"]:,}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        fig = create_comparison_chart(
-            d["hoje"], d["ontem"], d["d7"], d["prev7"], mp, MP_COLORS[mp]["primary"]
-        )
-        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-
-render_mp_card(c1, "Mercado Livre", "🟡", data_ml, "ml")
-render_mp_card(c2, "Shopee", "🟠", data_shp, "shp")
-render_mp_card(c3, "Outros", "⚪", data_out, "out")
+render_mp_card(c1, "Mercado Livre", "🟡", data_ml, "ml", hoje, ontem)
+render_mp_card(c2, "Shopee", "🟠", data_shp, "shp", hoje, ontem)
+render_mp_card(c3, "Outros", "⚪", data_out, "out", hoje, ontem)
 
 st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
+# ===== ANÁLISE DE TENDÊNCIAS =====
 st.markdown("<div class='section-title'>📈 Análise de Tendências</div>", unsafe_allow_html=True)
 
 col_trend, col_dist = st.columns([2.5, 1])
@@ -729,28 +898,91 @@ col_trend, col_dist = st.columns([2.5, 1])
 with col_trend:
     st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
     st.markdown(
-        f"**Evolução Diária — Últimos {dias_tendencia} dias (operacional)**",
+        f"**Evolução Diária — Últimos {dias_tendencia} dias**",
         unsafe_allow_html=True,
     )
     tstart = max(inicio_base, hoje - timedelta(days=dias_tendencia - 1))
     pv = daily_pivot(df, tstart, hoje)
     fig_trend = create_trend_chart(pv)
-    st.plotly_chart(fig_trend, width="stretch", config={"displayModeBar": False})
+    st.plotly_chart(fig_trend, use_container_width=True, config={"displayModeBar": False})
     st.markdown("</div>", unsafe_allow_html=True)
 
 with col_dist:
     st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
-    st.markdown("**Distribuição — Últimos 7 dias (operacional)**", unsafe_allow_html=True)
+    st.markdown("**Distribuição — Últimos 7 dias**", unsafe_allow_html=True)
     fig_donut = create_donut_chart(data_ml["d7"], data_shp["d7"], data_out["d7"])
-    st.plotly_chart(fig_donut, width="stretch", config={"displayModeBar": False})
+    st.plotly_chart(fig_donut, use_container_width=True, config={"displayModeBar": False})
     st.markdown("</div>", unsafe_allow_html=True)
 
+# ===== INSIGHTS ADICIONAIS =====
+st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
+st.markdown("<div class='section-title'>💡 Insights & Performance</div>", unsafe_allow_html=True)
+
+col_i1, col_i2, col_i3 = st.columns(3)
+
+with col_i1:
+    st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
+    st.markdown("**📊 Performance vs Meta (MTD)**", unsafe_allow_html=True)
+
+    dias_mes = (date(hoje.year, hoje.month + 1, 1) - timedelta(days=1)).day if hoje.month < 12 else 31
+    media_diaria = total_ontem
+    meta_mes = media_diaria * dias_mes
+
+    total_mtd = data_ml["mtd"] + data_shp["mtd"] + data_out["mtd"]
+
+    if meta_mes > 0:
+        perc_meta = (total_mtd / meta_mes) * 100
+        st.metric(
+            "Meta do Mês",
+            f"{perc_meta:.1f}%",
+            f"{total_mtd} / {meta_mes} pedidos"
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col_i2:
+    st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
+    st.markdown("**🏆 Top Marketplace (7D)**", unsafe_allow_html=True)
+
+    top_mp = max(
+        [("Mercado Livre", data_ml["d7"]), ("Shopee", data_shp["d7"]), ("Outros", data_out["d7"])],
+        key=lambda x: x[1]
+    )
+
+    st.metric(
+        "Líder da Semana",
+        top_mp[0],
+        f"{top_mp[1]} pedidos"
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col_i3:
+    st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
+    st.markdown("**📈 Crescimento Semanal**", unsafe_allow_html=True)
+
+    total_7d = data_ml["d7"] + data_shp["d7"] + data_out["d7"]
+    total_prev7 = data_ml["prev7"] + data_shp["prev7"] + data_out["prev7"]
+
+    crescimento = pct_change(total_7d, total_prev7)
+
+    st.metric(
+        "Variação 7D",
+        f"{crescimento:+.1f}%",
+        f"{total_7d} vs {total_prev7}"
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ===== FOOTER =====
 st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 st.caption(
-    f"🔐 Fonte: Supabase ({TABLE} • codigo_produto='__PEDIDO__') | "
-    f"Dashboard atualizado automaticamente | {VERCEL_URL}"
+    f"🔐 **Fonte de Dados:** Supabase ({TABLE}) | "
+    f"**Filtro:** codigo_produto='__PEDIDO__' | "
+    f"**Data Base:** data_pedido (operacional) | "
+    f"**Timezone:** {TZ_BR} | "
+    f"**Atualização:** Automática a cada 30s | "
+    f"**Produção:** {VERCEL_URL}"
 )
 
+# ===== AUTO REFRESH =====
 if auto:
     time.sleep(30)
     st.rerun()
