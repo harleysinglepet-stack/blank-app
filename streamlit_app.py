@@ -1,14 +1,15 @@
-# app.py — DASHBOARD PROFISSIONAL SINGLE PET v2.1 (TIMEZONE FIX)
+# app.py — DASHBOARD PROFISSIONAL SINGLE PET v2.2 (VOLUME REAL = DISTINCT)
 # Dashboard de vendas (volume) por marketplace com análise em tempo real
 # Dados operacionais baseados em data_pedido (dia real da venda)
 # Vercel URL: https://singlepet-dashboard.vercel.app
 #
-# 🔧 CORREÇÕES CRÍTICAS v2.1:
+# 🔧 CORREÇÕES CRÍTICAS v2.2:
 # - Timezone BR explícito (ZoneInfo America/Sao_Paulo)
 # - Filtro REST com range exclusivo (lt amanhã)
 # - Parse robusto DATE vs TIMESTAMP (evita bug de timezone)
 # - Paginação robusta (limit/offset) para não travar em 1000 linhas
-# - Padronização do tipo de df["d"] (datetime64[ns]) para evitar TypeError
+# - ✅ CONTAGEM REAL DE VOLUME: usa DISTINCT numero_ecommerce (não soma linhas)
+# - ✅ DEDUP no df por numero_ecommerce (garante volume real)
 
 from __future__ import annotations
 
@@ -24,10 +25,12 @@ import plotly.graph_objects as go
 
 # ========== CONFIGURAÇÕES ==========
 HTTP_TIMEOUT = 30
-PAGE_SIZE = 2000
 TABLE = "pedidos_tiny"
 VERCEL_URL = "https://singlepet-dashboard.vercel.app"
 TZ_BR = ZoneInfo("America/Sao_Paulo")
+
+# PostgREST costuma limitar melhor a 1000/req
+PAGE_SIZE = 1000
 
 # Cores profissionais por marketplace
 MP_COLORS = {
@@ -111,18 +114,21 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
         * se vier DATE puro (YYYY-MM-DD) => NÃO aplica timezone
         * se vier timestamp => aplica UTC -> BR
     - Padroniza df["d"] como datetime64[ns] normalizado (00:00)
+    - ✅ Volume real: inclui numero_ecommerce e remove duplicados por ele
 
     Returns:
-        DataFrame com colunas: data_pedido, marketplace, d (datetime normalizado)
+        DataFrame com colunas:
+          - numero_ecommerce
+          - data_pedido
+          - marketplace
+          - d (datetime normalizado)
     """
-    select_cols = "data_pedido,marketplace"
+    # ✅ Agora traz numero_ecommerce (chave do pedido)
+    select_cols = "numero_ecommerce,data_pedido,marketplace"
     base = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{TABLE}"
 
     dt1 = iso(d1)
     dt2_exclusive = iso(d2 + timedelta(days=1))
-
-    # PostgREST costuma limitar melhor a 1000/req
-    page_size = 1000
 
     url_base = (
         f"{base}"
@@ -131,7 +137,7 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
         f"&data_pedido=gte.{dt1}"
         f"&data_pedido=lt.{dt2_exclusive}"
         f"&order=data_pedido.asc"
-        f"&limit={page_size}"
+        f"&limit={PAGE_SIZE}"
     )
 
     rows: List[Dict[str, Any]] = []
@@ -152,10 +158,10 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
 
             rows.extend(batch)
 
-            if len(batch) < page_size:
+            if len(batch) < PAGE_SIZE:
                 break
 
-            offset += page_size
+            offset += PAGE_SIZE
             time.sleep(0.03)
 
         except Exception as e:
@@ -166,11 +172,16 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
     if df.empty:
         return df
 
+    # Garante colunas essenciais
+    for col in ["numero_ecommerce", "data_pedido", "marketplace"]:
+        if col not in df.columns:
+            st.error(f"❌ Coluna ausente no retorno do Supabase: {col}")
+            return pd.DataFrame()
+
     # ✅ PARSE DEFINITIVO (DATE vs TIMESTAMP)
     s = df["data_pedido"].astype(str).str.strip()
     is_date_only = s.str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)
 
-    # vamos montar uma Series de datetime (naive) normalizada
     d_series = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
 
     # DATE puro: vira datetime sem timezone
@@ -187,19 +198,21 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
             utc=True,
             errors="coerce"
         )
-        # converte para BR, depois tira timezone (fica naive)
         dt_br = dt_utc.dt.tz_convert(TZ_BR).dt.tz_localize(None)
         d_series.loc[~is_date_only] = dt_br
 
-    # normaliza para 00:00 do dia
     df["d"] = pd.to_datetime(d_series, errors="coerce").dt.normalize()
-
-    # Remove datas inválidas
     df = df[df["d"].notna()].copy()
 
     # Normaliza marketplace
     df["marketplace"] = df["marketplace"].apply(normalize_marketplace)
     df.loc[~df["marketplace"].isin(MPS), "marketplace"] = "Outros"
+
+    # ✅ Deduplicação por pedido (volume real)
+    # Mantém o primeiro registro (já ordenado por data_pedido asc)
+    df["numero_ecommerce"] = df["numero_ecommerce"].astype(str).str.strip()
+    df = df[df["numero_ecommerce"].ne("")].copy()
+    df = df.drop_duplicates(subset=["numero_ecommerce"], keep="first").reset_index(drop=True)
 
     return df
 
@@ -211,12 +224,14 @@ def last_data_disponivel(df: pd.DataFrame) -> Optional[date]:
     s = df["d"].dropna()
     if s.empty:
         return None
-    # df["d"] é datetime normalizado
     return pd.to_datetime(s.max()).date()
 
 
 def count_range(df: pd.DataFrame, d1: date, d2: date, mp: Optional[str] = None) -> int:
-    """Conta pedidos em um range de datas (inclusive), opcionalmente por marketplace"""
+    """
+    ✅ Conta VOLUME REAL de pedidos: DISTINCT numero_ecommerce
+    em um range de datas (inclusive), opcionalmente por marketplace.
+    """
     if df.empty:
         return 0
 
@@ -227,9 +242,9 @@ def count_range(df: pd.DataFrame, d1: date, d2: date, mp: Optional[str] = None) 
     d1_ts = pd.Timestamp(d1).normalize()
     d2_ts = pd.Timestamp(d2).normalize()
 
-    # df["d"] é datetime normalizado, então comparação é segura
     m = (x["d"] >= d1_ts) & (x["d"] <= d2_ts)
-    return int(m.sum())
+    # ✅ DISTINCT
+    return int(x.loc[m, "numero_ecommerce"].nunique())
 
 
 def fmt_delta(n: int) -> str:
@@ -246,15 +261,19 @@ def pct_change(current: int, previous: int) -> float:
 
 def daily_pivot(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
     """
-    Cria pivot table com dias nas linhas e marketplaces nas colunas.
-    Preenche dias sem dados com 0.
+    Pivot diário com contagem REAL (DISTINCT numero_ecommerce)
     """
     idx = pd.date_range(start=start, end=end, freq="D").normalize()
 
     if df.empty:
         return pd.DataFrame(index=idx, columns=MPS).fillna(0)
 
-    g = df.groupby(["d", "marketplace"]).size().reset_index(name="qtd")
+    # ✅ DISTINCT por dia e marketplace
+    g = (
+        df.groupby(["d", "marketplace"])["numero_ecommerce"]
+        .nunique()
+        .reset_index(name="qtd")
+    )
     pv = g.pivot(index="d", columns="marketplace", values="qtd").fillna(0)
 
     for mp in MPS:
@@ -321,7 +340,7 @@ def create_comparison_chart(
 
 
 def create_trend_chart(pv: pd.DataFrame) -> go.Figure:
-    """Gráfico de área empilhada com evolução diária por marketplace"""
+    """Gráfico de barras empilhadas com evolução diária por marketplace"""
     fig = go.Figure()
 
     for mp in MPS:
@@ -413,7 +432,7 @@ def create_donut_chart(ml: int, shp: int, out: int) -> go.Figure:
 
 # ========== CÁLCULO DE MÉTRICAS ==========
 def mp_metrics(df: pd.DataFrame, hoje: date, mp: str) -> Dict[str, Any]:
-    """Calcula todas as métricas para um marketplace específico."""
+    """Calcula todas as métricas para um marketplace específico (sempre por DISTINCT)"""
     ontem = hoje - timedelta(days=1)
     d7_ini = hoje - timedelta(days=6)
     prev7_fim = d7_ini - timedelta(days=1)
@@ -773,14 +792,14 @@ with st.sidebar:
     base_periodo = st.selectbox(
         "Início da análise:",
         ["01/02/2026", "01/01/2026", "Personalizado"],
-        index=0,
+        index=1,  # ✅ por padrão já pega histórico maior
     )
 
     if base_periodo == "Personalizado":
         hoje_br = datetime.now(TZ_BR).date()
         inicio_base = st.date_input(
             "Data inicial:",
-            value=date(2026, 2, 1),
+            value=date(2026, 1, 1),
             max_value=hoje_br
         )
     elif base_periodo == "01/02/2026":
@@ -801,9 +820,10 @@ with st.sidebar:
 
     st.subheader("ℹ️ Sobre")
     st.caption(
-        f"**Dashboard:** Single Pet v2.1\n\n"
+        f"**Dashboard:** Single Pet v2.2 (Volume Real)\n\n"
         f"**Fonte:** Supabase ({TABLE})\n\n"
         f"**Filtro:** codigo_produto='__PEDIDO__'\n\n"
+        f"**Chave de volume:** numero_ecommerce (DISTINCT)\n\n"
         f"**Data Base:** data_pedido (operacional)\n\n"
         f"**Timezone:** {TZ_BR}\n\n"
         f"**Produção:** {VERCEL_URL}"
@@ -814,8 +834,8 @@ agora_br = datetime.now(TZ_BR)
 hoje = agora_br.date()
 hora_atual = agora_br.strftime("%H:%M:%S")
 
-inicio_mes = date(hoje.year, hoje.month, 1)
-inicio_busca = min(inicio_base, inicio_mes, hoje - timedelta(days=dias_tendencia + 14))
+# ✅ IMPORTANTE: para espelhar o banco, buscamos desde o inicio_base (não recorta por tendência)
+inicio_busca = inicio_base
 
 with st.spinner("🔄 Carregando dados do Supabase..."):
     df = fetch_resumo(inicio_busca, hoje)
@@ -843,7 +863,8 @@ st.markdown(
     f"<div class='subtitle'>"
     f"<b>HOJE</b>: {hoje.strftime('%d/%m/%Y')} {hora_atual} (BR) • "
     f"<b>Último dia com dados</b>: {txt_ultimo_dia} • "
-    f"<b>Fonte</b>: Supabase / {TABLE} (data_pedido)"
+    f"<b>Fonte</b>: Supabase / {TABLE} (data_pedido) • "
+    f"<b>Volume</b>: DISTINCT numero_ecommerce"
     f"</div>",
     unsafe_allow_html=True,
 )
@@ -855,15 +876,17 @@ if debug_mode:
     st.write(f"- Hoje (BR): {hoje}")
     st.write(f"- Hora (BR): {hora_atual}")
     st.write(f"- Timezone: {TZ_BR}")
-    st.write(f"- Total registros carregados: {len(df)}")
+    st.write(f"- Total linhas carregadas (após dedup): {len(df)}")
     if not df.empty:
         st.write(f"- Min data (d): {df['d'].min().date() if pd.notna(df['d'].min()) else None}")
         st.write(f"- Max data (d): {df['d'].max().date() if pd.notna(df['d'].max()) else None}")
+        st.write(f"- Pedidos únicos carregados: {df['numero_ecommerce'].nunique()}")
         hoje_ts = pd.Timestamp(hoje).normalize()
         hoje_df = df[df["d"] == hoje_ts]
-        st.write(f"- Registros de hoje: {len(hoje_df)}")
+        st.write(f"- Pedidos únicos de hoje: {hoje_df['numero_ecommerce'].nunique()}")
         if not hoje_df.empty:
-            st.write(f"- Marketplaces hoje: {hoje_df['marketplace'].value_counts().to_dict()}")
+            mp_counts = hoje_df.groupby("marketplace")["numero_ecommerce"].nunique().to_dict()
+            st.write(f"- Marketplaces hoje (DISTINCT): {mp_counts}")
     else:
         st.write("- DataFrame vazio!")
     st.markdown("</div>", unsafe_allow_html=True)
@@ -922,21 +945,16 @@ col_i1, col_i2, col_i3 = st.columns(3)
 
 with col_i1:
     st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
-    st.markdown("**📊 Performance vs Meta (MTD)**", unsafe_allow_html=True)
+    st.markdown("**📊 Volume Total (período base)**", unsafe_allow_html=True)
 
-    dias_mes = (date(hoje.year, hoje.month + 1, 1) - timedelta(days=1)).day if hoje.month < 12 else 31
-    media_diaria = total_ontem
-    meta_mes = media_diaria * dias_mes
+    # ✅ total real do período carregado (DISTINCT)
+    total_periodo = int(df["numero_ecommerce"].nunique()) if not df.empty else 0
+    st.metric(
+        "Pedidos (DISTINCT)",
+        f"{total_periodo:,}",
+        f"Desde {inicio_base.strftime('%d/%m/%Y')}"
+    )
 
-    total_mtd = data_ml["mtd"] + data_shp["mtd"] + data_out["mtd"]
-
-    if meta_mes > 0:
-        perc_meta = (total_mtd / meta_mes) * 100
-        st.metric(
-            "Meta do Mês",
-            f"{perc_meta:.1f}%",
-            f"{total_mtd} / {meta_mes} pedidos"
-        )
     st.markdown("</div>", unsafe_allow_html=True)
 
 with col_i2:
@@ -976,6 +994,7 @@ st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 st.caption(
     f"🔐 **Fonte de Dados:** Supabase ({TABLE}) | "
     f"**Filtro:** codigo_produto='__PEDIDO__' | "
+    f"**Chave do volume:** DISTINCT numero_ecommerce | "
     f"**Data Base:** data_pedido (operacional) | "
     f"**Timezone:** {TZ_BR} | "
     f"**Atualização:** Automática a cada 30s | "
