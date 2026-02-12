@@ -1,6 +1,8 @@
 import streamlit as st
 
-st.title("🎈 My new app")
-st.write(
-    "Let's start building! For help and inspiration, head over to [docs.streamlit.io](https://docs.streamlit.io/)."
-)
+st.set_page_config(page_title="Dashboard Single Pet", layout="wide")
+
+st.title("📊 Dashboard Single Pet")
+st.success("Deploy funcionando 🚀")
+
+st.write("Agora vamos conectar dados.")
