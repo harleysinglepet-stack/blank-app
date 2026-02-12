@@ -1,7 +1,7 @@
-# app.py — DASHBOARD PROFISSIONAL SINGLE PET v2.2 (VOLUME REAL = DISTINCT)
+# streamlit_app.py — DASHBOARD PROFISSIONAL SINGLE PET v2.2.1 (VOLUME REAL = DISTINCT)
 # Dashboard de vendas (volume) por marketplace com análise em tempo real
 # Dados operacionais baseados em data_pedido (dia real da venda)
-# Vercel URL: https://singlepet-dashboard.vercel.app
+# Produção: https://singlepet-dashboard.vercel.app
 #
 # 🔧 CORREÇÕES CRÍTICAS v2.2:
 # - Timezone BR explícito (ZoneInfo America/Sao_Paulo)
@@ -14,7 +14,9 @@
 # ✅ v2.2.1 (ATUALIZAR AGORA = IMPORTA + REFRESH REAL)
 # - Botão "Atualizar agora" chama Edge Function BUSCA-TINY (via x-cron-secret) e depois limpa cache + rerun
 # - Headers anti-cache no REST do Supabase
-# - Troca use_container_width -> width="stretch" (evita warnings)
+#
+# ✅ HOTFIX (ERRO 400 POSTGREST)
+# - Troca filtro codigo_produto=in.(...) por OR: &or=(codigo_produto.eq.PEDIDO,codigo_produto.eq.__PEDIDO__)
 
 from __future__ import annotations
 
@@ -183,11 +185,13 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
     dt1 = iso(d1)
     dt2_exclusive = iso(d2 + timedelta(days=1))
 
-    # ✅ pega os dois formatos pra garantir compatibilidade
+    # ✅ HOTFIX: PostgREST não curtiu seu in.(...)
+    # Usamos OR, que é 100% compatível:
+    # &or=(codigo_produto.eq.PEDIDO,codigo_produto.eq.__PEDIDO__)
     url_base = (
         f"{base}"
         f"?select={select_cols}"
-        f"&codigo_produto=in.(\"PEDIDO\",\"__PEDIDO__\")"
+        f"&or=(codigo_produto.eq.PEDIDO,codigo_produto.eq.__PEDIDO__)"
         f"&data_pedido=gte.{dt1}"
         f"&data_pedido=lt.{dt2_exclusive}"
         f"&order=data_pedido.asc"
@@ -584,7 +588,7 @@ def render_mp_card(col, mp: str, emoji: str, d: Dict[str, Any], class_name: str,
         fig = create_comparison_chart(
             d["hoje"], d["ontem"], d["d7"], d["prev7"], mp, MP_COLORS[mp]["primary"]
         )
-        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -836,7 +840,7 @@ with st.sidebar:
     auto = st.toggle("🔄 Auto atualizar (30s)", value=True)
 
     # ✅ botão agora IMPORTA + REFRESH
-    if st.button("🔄 Atualizar agora", type="primary", width="stretch"):
+    if st.button("🔄 Atualizar agora", type="primary", use_container_width=True):
         with st.spinner("📦 Importando do Tiny (BUSCA-TINY) e atualizando o painel..."):
             res = trigger_busca_tiny_import(max_dias=2, incluir_hoje=True)
 
@@ -884,7 +888,7 @@ with st.sidebar:
     st.caption(
         f"**Dashboard:** Single Pet v2.2 (Volume Real)\n\n"
         f"**Fonte:** Supabase ({TABLE})\n\n"
-        f"**Filtro:** codigo_produto in ('PEDIDO','__PEDIDO__')\n\n"
+        f"**Filtro:** codigo_produto = 'PEDIDO' ou '__PEDIDO__'\n\n"
         f"**Chave de volume:** numero_ecommerce (DISTINCT)\n\n"
         f"**Data Base:** data_pedido (operacional)\n\n"
         f"**Timezone:** {TZ_BR}\n\n"
@@ -988,14 +992,14 @@ with col_trend:
     tstart = max(inicio_base, hoje - timedelta(days=dias_tendencia - 1))
     pv = daily_pivot(df, tstart, hoje)
     fig_trend = create_trend_chart(pv)
-    st.plotly_chart(fig_trend, width="stretch", config={"displayModeBar": False})
+    st.plotly_chart(fig_trend, use_container_width=True, config={"displayModeBar": False})
     st.markdown("</div>", unsafe_allow_html=True)
 
 with col_dist:
     st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
     st.markdown("**Distribuição — Últimos 7 dias**", unsafe_allow_html=True)
     fig_donut = create_donut_chart(data_ml["d7"], data_shp["d7"], data_out["d7"])
-    st.plotly_chart(fig_donut, width="stretch", config={"displayModeBar": False})
+    st.plotly_chart(fig_donut, use_container_width=True, config={"displayModeBar": False})
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ===== INSIGHTS ADICIONAIS =====
@@ -1053,7 +1057,7 @@ with col_i3:
 st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 st.caption(
     f"🔐 **Fonte de Dados:** Supabase ({TABLE}) | "
-    f"**Filtro:** codigo_produto in ('PEDIDO','__PEDIDO__') | "
+    f"**Filtro:** codigo_produto = 'PEDIDO' ou '__PEDIDO__' | "
     f"**Chave do volume:** DISTINCT numero_ecommerce | "
     f"**Data Base:** data_pedido (operacional) | "
     f"**Timezone:** {TZ_BR} | "
