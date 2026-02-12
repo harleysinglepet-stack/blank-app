@@ -133,7 +133,7 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
     url_base = (
         f"{base}"
         f"?select={select_cols}"
-        f"&codigo_produto=eq.__PEDIDO__"
+        f"&codigo_produto=in.(\"PEDIDO\",\"__PEDIDO__\")"
         f"&data_pedido=gte.{dt1}"
         f"&data_pedido=lt.{dt2_exclusive}"
         f"&order=data_pedido.asc"
