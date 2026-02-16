@@ -1,12 +1,11 @@
-# streamlit_app.py — DASHBOARD PROFISSIONAL SINGLE PET v2.2.2 (ESTÁVEL)
+# streamlit_app.py — DASHBOARD PROFISSIONAL SINGLE PET v2.3.0 (FULL ML + NÃO-FULL)
 # Dashboard de vendas (volume) por marketplace com análise em tempo real
 # Dados operacionais baseados em data_pedido (dia real da venda)
 #
-# ✅ v2.2.2 (FIX):
-# - Remove parâmetro "_ts" que quebrava PostgREST (Supabase HTTP 400)
-# - Mantém anti-cache via headers
-# - Mantém DISTINCT numero_ecommerce (volume real)
-# - Rodapé + insights claros (sem "MTD" técnico)
+# ✅ v2.3.0 (ADD):
+# - Inclui ml_is_fulfillment no fetch
+# - Mercado Livre: exibe TOTAL (FULL + NÃO-FULL) + detalhamento FULL / NÃO-FULL (Hoje, 7D, Mês)
+# - Dedup robusto por numero_ecommerce preservando FULL (se qualquer linha do pedido for FULL, pedido vira FULL)
 
 from __future__ import annotations
 
@@ -83,6 +82,16 @@ def supabase_headers() -> Dict[str, str]:
     }
 
 
+def to_bool_series(x: pd.Series) -> pd.Series:
+    """
+    Converte valores variados em boolean com segurança.
+    """
+    if x.dtype == bool:
+        return x.fillna(False)
+    s = x.astype(str).str.strip().str.lower()
+    return s.isin(["true", "t", "1", "yes", "y", "sim"]).fillna(False)
+
+
 # ========== FETCH ==========
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
@@ -93,8 +102,10 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
     - Paginação robusta: limit/offset + order
     - Parse robusto DATE vs TIMESTAMP
     - Volume real: DISTINCT numero_ecommerce (dedup)
+    - Preserva FULL do ML: se qualquer linha do pedido estiver FULL, o pedido vira FULL
     """
-    select_cols = "numero_ecommerce,data_pedido,marketplace"
+    # ✅ agora traz ml_is_fulfillment
+    select_cols = "numero_ecommerce,data_pedido,marketplace,ml_is_fulfillment"
     base = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{TABLE}"
 
     dt1 = iso(d1)
@@ -137,11 +148,15 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # valida colunas
+    # valida colunas mínimas
     for col in ["numero_ecommerce", "data_pedido", "marketplace"]:
         if col not in df.columns:
             st.error(f"❌ Coluna ausente no retorno do Supabase: {col}")
             return pd.DataFrame()
+
+    # se ml_is_fulfillment não vier por algum motivo, cria False (não quebra o app)
+    if "ml_is_fulfillment" not in df.columns:
+        df["ml_is_fulfillment"] = False
 
     # parse data_pedido: DATE vs TIMESTAMP
     s = df["data_pedido"].astype(str).str.strip()
@@ -163,12 +178,33 @@ def fetch_resumo(d1: date, d2: date) -> pd.DataFrame:
     df["marketplace"] = df["marketplace"].apply(normalize_marketplace)
     df.loc[~df["marketplace"].isin(MPS), "marketplace"] = "Outros"
 
-    # volume real = distinct numero_ecommerce
+    # normaliza numero_ecommerce
     df["numero_ecommerce"] = df["numero_ecommerce"].astype(str).str.strip()
     df = df[df["numero_ecommerce"].ne("")].copy()
-    df = df.drop_duplicates(subset=["numero_ecommerce"], keep="first").reset_index(drop=True)
 
-    return df
+    # normaliza flag full
+    df["ml_is_fulfillment"] = to_bool_series(df["ml_is_fulfillment"])
+
+    # ✅ DEDUP ROBUSTO preservando FULL:
+    # - se qualquer linha do pedido tiver ml_is_fulfillment True, o pedido fica True
+    # - mantém menor data (d) do pedido
+    # - mantém marketplace (assume consistente por pedido)
+    agg = (
+        df.groupby("numero_ecommerce", as_index=False)
+        .agg(
+            d=("d", "min"),
+            marketplace=("marketplace", "first"),
+            ml_is_fulfillment=("ml_is_fulfillment", "max"),
+        )
+    )
+
+    # garante tipos finais
+    agg["d"] = pd.to_datetime(agg["d"], errors="coerce").dt.normalize()
+    agg["marketplace"] = agg["marketplace"].apply(normalize_marketplace)
+    agg.loc[~agg["marketplace"].isin(MPS), "marketplace"] = "Outros"
+    agg["ml_is_fulfillment"] = agg["ml_is_fulfillment"].astype(bool)
+
+    return agg.reset_index(drop=True)
 
 
 def last_data_disponivel(df: pd.DataFrame) -> Optional[date]:
@@ -186,6 +222,18 @@ def count_range(df: pd.DataFrame, d1: date, d2: date, mp: Optional[str] = None) 
     x = df
     if mp:
         x = x[x["marketplace"] == mp]
+    d1_ts = pd.Timestamp(d1).normalize()
+    d2_ts = pd.Timestamp(d2).normalize()
+    m = (x["d"] >= d1_ts) & (x["d"] <= d2_ts)
+    return int(x.loc[m, "numero_ecommerce"].nunique())
+
+
+def count_range_full_ml(df: pd.DataFrame, d1: date, d2: date) -> int:
+    if df.empty:
+        return 0
+    if "ml_is_fulfillment" not in df.columns:
+        return 0
+    x = df[(df["marketplace"] == "Mercado Livre") & (df["ml_is_fulfillment"] == True)]
     d1_ts = pd.Timestamp(d1).normalize()
     d2_ts = pd.Timestamp(d2).normalize()
     m = (x["d"] >= d1_ts) & (x["d"] <= d2_ts)
@@ -307,9 +355,18 @@ def create_donut_chart(ml: int, shp: int, out: int) -> go.Figure:
             )
         ]
     )
-    fig.add_annotation(text=f"<b>{total:,}</b><br><span style='font-size:12px'>TOTAL</span>",
-                       x=0.5, y=0.5, showarrow=False)
-    fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor="rgba(0,0,0,0)", showlegend=False)
+    fig.add_annotation(
+        text=f"<b>{total:,}</b><br><span style='font-size:12px'>TOTAL</span>",
+        x=0.5,
+        y=0.5,
+        showarrow=False,
+    )
+    fig.update_layout(
+        height=320,
+        margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+    )
     return fig
 
 
@@ -329,7 +386,7 @@ def mp_metrics(df: pd.DataFrame, hoje: date, mp: str) -> Dict[str, Any]:
 
     mtd_mp = count_range(df, mtd_ini, hoje, mp)
 
-    return {
+    out: Dict[str, Any] = {
         "hoje": hoje_mp,
         "ontem": ontem_mp,
         "delta_dia": hoje_mp - ontem_mp,
@@ -340,6 +397,18 @@ def mp_metrics(df: pd.DataFrame, hoje: date, mp: str) -> Dict[str, Any]:
         "pct_7d": pct_change(d7_mp, prev7_mp),
         "mtd": mtd_mp,
     }
+
+    # ✅ extras só para ML: FULL / NÃO-FULL (mas mantendo TOTAL como principal)
+    if mp == "Mercado Livre":
+        out["full_hoje"] = count_range_full_ml(df, hoje, hoje)
+        out["full_7d"] = count_range_full_ml(df, d7_ini, hoje)
+        out["full_mtd"] = count_range_full_ml(df, mtd_ini, hoje)
+
+        out["nao_full_hoje"] = max(0, out["hoje"] - out["full_hoje"])
+        out["nao_full_7d"] = max(0, out["d7"] - out["full_7d"])
+        out["nao_full_mtd"] = max(0, out["mtd"] - out["full_mtd"])
+
+    return out
 
 
 def render_status_banner(hoje: date, ultima_dia: Optional[date], total_hoje: int, total_ontem: int):
@@ -397,6 +466,22 @@ st.markdown(
       .kpi-delta.positive { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
       .kpi-delta.negative { background: rgba(239, 68, 68, 0.2); color: #f87171; }
       .kpi-delta.neutral  { background: rgba(156, 163, 175, 0.2); color: #9ca3af; }
+
+      /* pills para FULL */
+      .pill {
+        display:inline-block;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.10);
+        background: rgba(255,255,255,0.04);
+        font-size: 11px;
+        font-weight: 800;
+        margin-right: 6px;
+        margin-bottom: 8px;
+        opacity: 0.95;
+      }
+      .pill b { font-weight: 900; }
+      .pillWrap { margin: 6px 0 8px 0; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -488,6 +573,7 @@ data_ml = mp_metrics(df, hoje, "Mercado Livre")
 data_shp = mp_metrics(df, hoje, "Shopee")
 data_out = mp_metrics(df, hoje, "Outros")
 
+
 def render_mp_card(col, mp: str, emoji: str, d: Dict[str, Any], hoje: date, ontem: date):
     with col:
         st.markdown("<div class='mpCard'>", unsafe_allow_html=True)
@@ -496,6 +582,30 @@ def render_mp_card(col, mp: str, emoji: str, d: Dict[str, Any], hoje: date, onte
             f"<div class='mpSub'>Período: Hoje ({hoje.strftime('%d/%m')}) • Ontem ({ontem.strftime('%d/%m')}) • 7 Dias • Acumulado do mês</div>",
             unsafe_allow_html=True,
         )
+
+        # ✅ detalhamento FULL apenas no card do ML
+        if mp == "Mercado Livre":
+            full_hoje = int(d.get("full_hoje", 0))
+            full_7d = int(d.get("full_7d", 0))
+            full_mtd = int(d.get("full_mtd", 0))
+
+            nao_full_hoje = int(d.get("nao_full_hoje", max(0, d["hoje"] - full_hoje)))
+            nao_full_7d = int(d.get("nao_full_7d", max(0, d["d7"] - full_7d)))
+            nao_full_mtd = int(d.get("nao_full_mtd", max(0, d["mtd"] - full_mtd)))
+
+            st.markdown(
+                f"""
+                <div class='pillWrap'>
+                  <span class='pill'>🚚 FULL hoje: <b>{full_hoje:,}</b></span>
+                  <span class='pill'>📭 Não-FULL hoje: <b>{nao_full_hoje:,}</b></span><br>
+                  <span class='pill'>🚚 FULL 7D: <b>{full_7d:,}</b></span>
+                  <span class='pill'>📭 Não-FULL 7D: <b>{nao_full_7d:,}</b></span><br>
+                  <span class='pill'>🚚 FULL mês: <b>{full_mtd:,}</b></span>
+                  <span class='pill'>📭 Não-FULL mês: <b>{nao_full_mtd:,}</b></span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
         delta_class = "positive" if d["delta_dia"] > 0 else ("negative" if d["delta_dia"] < 0 else "neutral")
         st.markdown(
@@ -541,6 +651,7 @@ def render_mp_card(col, mp: str, emoji: str, d: Dict[str, Any], hoje: date, onte
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
         st.markdown("</div>", unsafe_allow_html=True)
 
+
 c1, c2, c3 = st.columns(3)
 render_mp_card(c1, "Mercado Livre", "🟡", data_ml, hoje, ontem)
 render_mp_card(c2, "Shopee", "🟠", data_shp, hoje, ontem)
@@ -562,8 +673,11 @@ with col_trend:
 with col_dist:
     st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
     st.markdown("**Distribuição — Últimos 7 dias**")
-    st.plotly_chart(create_donut_chart(data_ml["d7"], data_shp["d7"], data_out["d7"]),
-                    use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(
+        create_donut_chart(data_ml["d7"], data_shp["d7"], data_out["d7"]),
+        use_container_width=True,
+        config={"displayModeBar": False},
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
